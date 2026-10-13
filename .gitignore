@@ -1,0 +1,79 @@
+# Festool Recon Monitor - Git Ignore File
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Backup files
+backups/
+*.backup
+
+# Log files
+logs/
+*.log
+
+# Export files
+exports/
+*.csv
+*.xlsx
+*.json
+
+# Other files
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Configuration files with sensitive data
+config.ini
+*.secret
+*.key
+.env
+
+# Credential encryption key - never commit; losing it means saved
+# notification credentials must be re-entered
+.secret.key
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# OS specific
+Thumbs.db
+desktop.ini

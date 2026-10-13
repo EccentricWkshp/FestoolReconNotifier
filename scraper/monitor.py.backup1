@@ -1,0 +1,313 @@
+import logging
+from datetime import datetime
+from typing import Optional, Callable
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
+import time
+
+from .festool_scraper import FestoolScraper
+from database.manager import DatabaseManager
+
+logger = logging.getLogger(__name__)
+
+
+class MonitorService:
+    """Background service for monitoring product changes with validation."""
+    
+    def __init__(self, db_manager: DatabaseManager, 
+                 on_product_change: Optional[Callable] = None,
+                 validation_checks: int = 3,
+                 validation_delay: int = 2):
+        """
+        Initialize monitor with validation settings.
+        
+        Args:
+            db_manager: Database manager instance
+            on_product_change: Callback for product changes
+            validation_checks: Number of validation checks (default: 3)
+            validation_delay: Seconds between validation checks (default: 2)
+        """
+        self.db_manager = db_manager
+        # Don't store scraper - create fresh for each request
+        self.on_product_change = on_product_change
+        self.last_product_id = None
+        self.last_item_number = None
+        self.is_running = False
+        self._stopping = False
+        
+        # Validation settings
+        self.validation_checks = validation_checks
+        self.validation_delay = validation_delay
+        
+        # Create scheduler once and reuse it
+        self.scheduler = BackgroundScheduler(
+            job_defaults={
+                'coalesce': True,
+                'max_instances': 1,
+                'misfire_grace_time': 60
+            }
+        )
+        
+        # Add error listener
+        self.scheduler.add_listener(
+            self._job_error_listener,
+            EVENT_JOB_ERROR | EVENT_JOB_EXECUTED
+        )
+        
+    def start(self, interval_minutes: int = 5):
+        """Start monitoring with specified interval."""
+        if self.is_running:
+            logger.warning("Monitor already running")
+            return
+        
+        try:
+            # Get latest product to track changes
+            latest = self.db_manager.get_latest_product()
+            if latest:
+                self.last_product_id = latest.id
+                self.last_item_number = latest.item_number
+            
+            # Remove any existing job
+            if self.scheduler.get_job('product_monitor'):
+                self.scheduler.remove_job('product_monitor')
+            
+            # Add the monitoring job
+            self.scheduler.add_job(
+                self._check_for_changes,
+                trigger=IntervalTrigger(minutes=interval_minutes),
+                id='product_monitor',
+                replace_existing=True,
+                name='Product Monitor Job'
+            )
+            
+            # Start scheduler if not already started
+            if not self.scheduler.running:
+                self.scheduler.start()
+            
+            self._stopping = False
+            self.is_running = True
+            logger.info(f"Monitor started with {interval_minutes} minute interval (validation: {self.validation_checks} checks)")
+            
+        except Exception as e:
+            logger.error(f"Error starting monitor: {e}", exc_info=True)
+            raise
+    
+    def stop(self):
+        """Stop monitoring."""
+        if not self.is_running:
+            return
+        
+        self._stopping = True
+        logger.info("Stopping monitor...")
+        
+        try:
+            # Pause the scheduler to prevent new job submissions
+            if self.scheduler and self.scheduler.running:
+                self.scheduler.pause()
+                
+                # Wait a tiny bit for any running jobs to finish
+                time.sleep(0.2)
+                
+                # Remove the monitoring job
+                try:
+                    self.scheduler.remove_job('product_monitor')
+                except:
+                    pass  # Job might already be gone
+                
+                # Resume scheduler (but job is gone, so nothing will run)
+                self.scheduler.resume()
+            
+            self.is_running = False
+            logger.info("Monitor stopped")
+            
+        except Exception as e:
+            logger.warning(f"Error during monitor stop: {e}")
+            self.is_running = False
+    
+    def check_now(self) -> Optional[dict]:
+        """Manually trigger a check."""
+        return self._check_for_changes()
+    
+    def update_interval(self, interval_minutes: int):
+        """Update check interval."""
+        if self.is_running and self.scheduler and self.scheduler.running:
+            try:
+                # Reschedule the job with new interval
+                self.scheduler.reschedule_job(
+                    'product_monitor',
+                    trigger=IntervalTrigger(minutes=interval_minutes)
+                )
+                logger.info(f"Interval updated to {interval_minutes} minutes")
+            except Exception as e:
+                logger.error(f"Error updating interval: {e}")
+                # Fall back to restart
+                self.stop()
+                time.sleep(0.3)
+                self.start(interval_minutes)
+    
+    def _job_error_listener(self, event):
+        """Listen for job errors."""
+        if event.exception:
+            logger.error(f"Job error: {event.exception}")
+    
+    def _validate_product_change(self, new_item_number: str) -> bool:
+        """
+        Validate that a product change is real by checking multiple times.
+        Creates fresh scraper for each validation check to avoid caching.
+        
+        Returns True if change is confirmed, False if it's a false positive.
+        """
+        if not self.last_item_number:
+            logger.info("First product detected - no validation needed")
+            return True  # First product, assume valid
+        
+        if new_item_number == self.last_item_number:
+            return False  # No change
+        
+        # Detected a potential change - validate it
+        logger.info(f"Product change detected: {self.last_item_number} -> {new_item_number}")
+        logger.info(f"Performing {self.validation_checks} validation checks (every {self.validation_delay}s)...")
+        
+        # Perform multiple validation checks with FRESH scrapers
+        for check_num in range(1, self.validation_checks):
+            time.sleep(self.validation_delay)
+            
+            try:
+                # Create fresh scraper to avoid any caching
+                validation_scraper = FestoolScraper()
+                validation_product = validation_scraper.fetch_current_product()
+                
+                if not validation_product:
+                    logger.warning(f"Validation check #{check_num} failed - no product found")
+                    logger.warning("False positive: Scraping failed during validation")
+                    return False
+                
+                validation_item = validation_product['item_number']
+                
+                if validation_item != new_item_number:
+                    logger.warning(
+                        f"Validation check #{check_num} FAILED: "
+                        f"Returned {validation_item} instead of {new_item_number}"
+                    )
+                    logger.warning(
+                        f"False positive detected and ignored. "
+                        f"Keeping current product: {self.last_item_number}"
+                    )
+                    return False
+                
+                logger.info(f"Validation check #{check_num}: Confirmed {new_item_number} ✓")
+                
+            except Exception as e:
+                logger.error(f"Error during validation check #{check_num}: {e}")
+                logger.warning("False positive: Validation failed due to error")
+                return False
+        
+        # All validation checks passed
+        logger.info(
+            f"✓ Product change VALIDATED: All {self.validation_checks} checks confirmed {new_item_number}"
+        )
+        logger.info("This is a REAL product change - proceeding with notification")
+        return True
+    
+    def _check_for_changes(self) -> Optional[dict]:
+        """Check for product changes with fresh scraper instance."""
+        # Don't run if we're stopping
+        if self._stopping:
+            logger.debug("Skipping check - monitor is stopping")
+            return None
+            
+        try:
+            # Create FRESH scraper instance to avoid any session/cache reuse
+            scraper = FestoolScraper()
+            current_product = scraper.fetch_current_product()
+            
+            if not current_product:
+                logger.warning("No product found on page")
+                return None
+            
+            current_item_number = current_product.get('item_number')
+            
+            # Validate that we have required fields
+            if not current_item_number:
+                logger.error(f"Product missing item number: {current_product.get('name')}")
+                logger.error("Cannot track product without item number - skipping this check")
+                return None
+            
+            # Check if this is a new product
+            latest = self.db_manager.get_latest_product()
+            
+            if not latest or latest.item_number != current_item_number:
+                # Potential change detected - validate it
+                if not self._validate_product_change(current_item_number):
+                    logger.info(f"False positive ignored. Current product remains: {self.last_item_number}")
+                    return None
+                
+                # Change validated - proceed
+                logger.info(f"CONFIRMED new product: {current_product['name']}")
+                
+                # Mark previous product as replaced
+                if latest:
+                    self.db_manager.mark_product_replaced(latest.id)
+                
+                # Add new product
+                new_product = self.db_manager.add_product(
+                    item_number=current_product['item_number'],
+                    name=current_product['name'],
+                    sale_price=current_product['sale_price'],
+                    regular_price=current_product['regular_price'],
+                    description=current_product['description'],
+                    image_url=current_product['image_url'],
+                    raw_html=current_product['raw_html']
+                )
+                
+                self.last_product_id = new_product.id
+                self.last_item_number = new_product.item_number
+                
+                # Trigger callback if provided (don't run during shutdown)
+                if self.on_product_change and not self._stopping:
+                    try:
+                        self.on_product_change(new_product)
+                    except Exception as e:
+                        logger.error(f"Error in product change callback: {e}")
+                
+                return current_product
+            else:
+                logger.debug("No product change detected")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error checking for changes: {e}", exc_info=True)
+            return None
+    
+    def shutdown(self):
+        """Completely shutdown the scheduler (called on app exit)."""
+        logger.info("Shutting down monitor service...")
+        
+        self._stopping = True
+        self.is_running = False
+        
+        try:
+            if self.scheduler:
+                # Remove all jobs first
+                self.scheduler.remove_all_jobs()
+                
+                # Wait a moment
+                time.sleep(0.2)
+                
+                # Shutdown scheduler if running
+                if self.scheduler.running:
+                    self.scheduler.shutdown(wait=False)
+                    
+        except Exception as e:
+            logger.warning(f"Error during scheduler shutdown: {e}")
+        
+        logger.info("Monitor service shut down")
+    
+    def __del__(self):
+        """Cleanup on deletion."""
+        try:
+            if self.is_running or (self.scheduler and self.scheduler.running):
+                self.shutdown()
+        except:
+            pass

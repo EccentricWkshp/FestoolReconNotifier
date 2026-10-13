@@ -1,0 +1,28 @@
+# Core dependencies
+PyQt6>=6.3.0
+SQLAlchemy==2.0.23
+requests==2.31.0
+beautifulsoup4==4.12.2
+lxml==5.1.0
+APScheduler==3.10.4
+
+# Notifications
+# pushbullet.py is no longer used - the notifier posts to the documented v2
+# API directly, because that client blocks with no timeout in its constructor.
+twilio==8.10.0          # required for SMS notifications
+
+# Data export
+pandas==2.1.4
+openpyxl==3.1.2
+
+# Numerics (required by pandas)
+numpy==1.26.2
+
+# Security
+bcrypt==4.1.2
+cryptography==41.0.7
+
+# Catalog index (optional - only needed to run build_catalog_index.py, never
+# to run the app itself; the app reads the table that script writes).
+# MIT-licensed, unlike PyMuPDF, which is AGPL.
+pdfplumber==0.11.10
