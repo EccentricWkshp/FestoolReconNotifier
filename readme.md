@@ -832,7 +832,6 @@ Future enhancements under consideration:
 - [ ] Watchlist alerts keyed to a target price ("tell me when this drops below X")
 - [ ] Multi-user support with individual accounts
 - [ ] Web interface for remote monitoring
-- [ ] Mobile push notifications (native apps)
 - [ ] Integration with more notification services
 - [ ] Cloud database sync option
 
