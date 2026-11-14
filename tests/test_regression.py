@@ -1285,6 +1285,52 @@ def unverifiable_stock_keeps_the_scrape():
     assert product['item_number'] == LIVE[1]
 
 
+def rate_limited_stock_check_backs_off():
+    """
+    A 429 on the stock endpoint pauses it instead of retrying every check.
+
+    The store refused /products/<handle>.js for every one-minute check in a
+    row; asking again each minute only keeps the throttle going.  The pause
+    has to survive across scrapers, because the monitor builds a fresh one
+    per check, and the scrape itself must still go through meanwhile.
+    """
+    from scraper import festool_scraper as fs
+
+    class _Throttled(_FakeResponse):
+        headers = {'Retry-After': '1800'}
+
+    base = _router(_product_html(*LIVE), {LIVE[0]: True}, _feed((LIVE, True)))
+
+    def route(url):
+        if url.split('?')[0].endswith('.js'):
+            return _Throttled(status=429)
+        return base(url)
+
+    fs.FestoolScraper._reset_stock_backoff()
+    try:
+        first, fake1 = _fetch_with(route)
+        second, fake2 = _fetch_with(route)
+
+        assert first is not None and first['item_number'] == LIVE[1], \
+            "a throttled stock check discarded the scrape"
+        assert second is not None and second['item_number'] == LIVE[1]
+        assert sum(u.endswith('.js') for u in fake1.calls) == 1
+        assert not any(u.endswith('.js') for u in fake2.calls), \
+            "asked the throttled endpoint again on the very next check"
+
+        remaining = fs.FestoolScraper._stock_paused_until - fs.time.monotonic()
+        assert 1700 < remaining <= 1800, f"Retry-After ignored: paused {remaining:.0f}s"
+
+        # Once the pause runs out the endpoint is tried again, and a real
+        # answer clears the backoff
+        fs.FestoolScraper._stock_paused_until = 0.0
+        _, fake3 = _fetch_with(base)
+        assert any(u.endswith('.js') for u in fake3.calls)
+        assert fs.FestoolScraper._stock_backoff == 0.0
+    finally:
+        fs.FestoolScraper._reset_stock_backoff()
+
+
 def stale_front_page_with_no_fallback_records_nothing():
     """Better to skip a check than to record a sold-out product."""
     router = _router(_product_html(*SOLD), {SOLD[0]: False}, None)
@@ -1331,6 +1377,7 @@ check("feed price beats a cached page price", feed_price_beats_a_cached_page_pri
 check("sold-out head of the queue stepped over", sold_out_head_of_the_queue_is_stepped_over)
 check("feed outage falls back to the front page", feed_outage_falls_back_to_the_front_page)
 check("failed stock check does not discard scrape", unverifiable_stock_keeps_the_scrape)
+check("rate-limited stock check backs off", rate_limited_stock_check_backs_off)
 check("no fallback records nothing", stale_front_page_with_no_fallback_records_nothing)
 check("queue positions skip sold-out items", queue_positions_skip_sold_out_items)
 

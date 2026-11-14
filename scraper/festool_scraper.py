@@ -1,5 +1,6 @@
 """Festool Recon website scraper."""
 import re
+import time
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -39,6 +40,18 @@ class FestoolScraper:
     # How many per-product stock checks to spend walking past sold-out
     # candidates before giving up on the feed
     MAX_STOCK_CHECKS = 3
+
+    # When the store answers a stock check with 429 the endpoint is left alone
+    # for a while, doubling on each repeat refusal up to the cap.  A check
+    # every minute against an endpoint that is refusing us only keeps the
+    # throttle going.
+    STOCK_BACKOFF_INITIAL = 15 * 60
+    STOCK_BACKOFF_MAX = 2 * 60 * 60
+
+    # Shared by every instance: callers build a fresh scraper per check, so
+    # per-instance state would forget the throttle immediately.
+    _stock_paused_until = 0.0   # time.monotonic() deadline
+    _stock_backoff = 0.0        # length of the last pause, in seconds
 
     def __init__(self, timeout: int = 30, collection: Optional[str] = None):
         self.timeout = timeout
@@ -237,16 +250,59 @@ class FestoolScraper:
         it reflects reality even while the front page is being served stale.
 
         Returns True/False, or None when the check could not be made - callers
-        must treat None as "unknown", never as "sold out".
+        must treat None as "unknown", never as "sold out".  That includes the
+        stretch after a 429, when no request is made at all (see
+        _pause_stock_checks).
         """
+        if time.monotonic() < FestoolScraper._stock_paused_until:
+            logger.debug(f"Stock checks paused after a 429 - not checking '{handle}'")
+            return None
+
         url = f"{self.BASE_URL}products/{handle}.js"
         try:
             response = requests.get(url, headers=self._json_headers(), timeout=self.timeout)
+            if response.status_code == 429:
+                self._pause_stock_checks(response)
+                return None
             response.raise_for_status()
-            return bool(response.json().get('available'))
+            available = bool(response.json().get('available'))
         except (requests.RequestException, ValueError) as e:
             logger.warning(f"Could not confirm stock for '{handle}': {e}")
             return None
+
+        if FestoolScraper._stock_backoff:
+            logger.info("Per-product stock checks are being answered again")
+            FestoolScraper._stock_backoff = 0.0
+        return available
+
+    def _pause_stock_checks(self, response) -> None:
+        """
+        Stop asking for per-product stock after the store says "too many".
+
+        Honours Retry-After when the store sends one, otherwise backs off
+        exponentially.  Only the stock check pauses - the feed and the pages
+        carry on, and the feed's own ``available`` flags stand in meanwhile.
+        """
+        backoff = min(max(FestoolScraper._stock_backoff * 2, self.STOCK_BACKOFF_INITIAL),
+                      self.STOCK_BACKOFF_MAX)
+        FestoolScraper._stock_backoff = backoff
+
+        retry_after = _retry_after_seconds(response)
+        pause = max(backoff, min(retry_after or 0, self.STOCK_BACKOFF_MAX))
+        FestoolScraper._stock_paused_until = time.monotonic() + pause
+
+        logger.warning(
+            f"Store is rate-limiting per-product stock checks (429"
+            + (f", Retry-After {retry_after:.0f}s" if retry_after else "")
+            + f") - pausing them for {pause / 60:.0f} min; the collection "
+            f"feed's stock flags will be relied on meanwhile"
+        )
+
+    @classmethod
+    def _reset_stock_backoff(cls) -> None:
+        """Forget any 429 pause (for tests)."""
+        FestoolScraper._stock_paused_until = 0.0
+        FestoolScraper._stock_backoff = 0.0
 
     def _fetch_feed(self) -> List[FeedEntry]:
         """
@@ -797,3 +853,13 @@ def _to_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _retry_after_seconds(response) -> Optional[float]:
+    """Retry-After as seconds, or None when absent or given as a date."""
+    headers = getattr(response, 'headers', None) or {}
+    try:
+        value = float(headers.get('Retry-After', ''))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
