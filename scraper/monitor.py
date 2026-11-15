@@ -166,6 +166,9 @@ class MonitorService:
 
             # What each collection is offering, and what the front page is doing
             result['feeds'] = feeds = scraper.fetch_feeds(handles)
+            # The page scraper resolves the live product from this same feed;
+            # handing it over saves downloading it twice per check.
+            page_scraper.prime_feeds(scraper.raw_feeds)
             result['storefront'] = storefront = page_scraper.read_storefront()
 
             previous_modes = self.db_manager.get_collection_modes()
@@ -387,7 +390,8 @@ class MonitorService:
             logger.error(f"Job error: {event.exception}")
     
     def _validate_product_change(self, new_item_number: str,
-                                 force: bool = False) -> bool:
+                                 force: bool = False,
+                                 collection: Optional[str] = None) -> bool:
         """
         Validate that a product change is real by checking multiple times.
         Creates fresh scraper for each validation check to avoid caching.
@@ -397,6 +401,12 @@ class MonitorService:
         has started again.  It skips the "same number, no change" shortcut but
         keeps the re-confirmations, which matter more than usual coming out of
         a sale with a front-page cache that has just been rewritten.
+
+        ``collection`` is the collection the store is rotating through.  The
+        re-checks must read that same feed: the live product is resolved from
+        it, and one built on the default name would look for the item in the
+        wrong collection and reject every real change whenever the store
+        rotates out of anything else.
 
         Returns True if change is confirmed, False if it's a false positive.
         """
@@ -423,7 +433,7 @@ class MonitorService:
 
             try:
                 # Create fresh scraper to avoid any caching
-                validation_scraper = FestoolScraper()
+                validation_scraper = FestoolScraper(collection=collection)
                 validation_product = validation_scraper.fetch_current_product()
 
                 if not validation_product:
@@ -546,7 +556,8 @@ class MonitorService:
             if not latest or resuming or latest.item_number != current_item_number:
                 # Potential change detected - validate it
                 if not self._validate_product_change(current_item_number,
-                                                     force=resuming):
+                                                     force=resuming,
+                                                     collection=single_handle):
                     logger.info(f"False positive ignored. Current product remains: {self.last_item_number}")
                     return None
 

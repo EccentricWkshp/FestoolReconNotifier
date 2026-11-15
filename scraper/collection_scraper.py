@@ -232,6 +232,9 @@ class CollectionScraper:
 
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
+        # The unfiltered feed of each collection fetch_feeds() read, kept so
+        # the page scraper can reuse it instead of downloading it again
+        self.raw_feeds: Dict[str, List[dict]] = {}
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -431,6 +434,7 @@ class CollectionScraper:
             products = self._fetch_all_pages(handle)
             if products is None:
                 continue
+            self.raw_feeds[handle] = products
             feeds[handle] = self._build_queue(products, handle)
         return feeds
 

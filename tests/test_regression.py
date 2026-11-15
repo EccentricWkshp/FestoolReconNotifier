@@ -1331,6 +1331,57 @@ def rate_limited_stock_check_backs_off():
         fs.FestoolScraper._reset_stock_backoff()
 
 
+def one_check_downloads_the_feed_once():
+    """
+    A monitoring check reads each collection feed exactly once.
+
+    The survey and the live-product resolution both need the same feed, and
+    it is the only stock source the store still answers, so fetching it twice
+    per check only doubles the risk of it being rate-limited as well.  This
+    has to be tested through a real check: the saving depends on the monitor
+    handing the survey's copy to the page scraper.
+    """
+    from scraper import collection_scraper as cs
+    from scraper import festool_scraper as fs
+    from scraper.monitor import MonitorService
+    from scraper.collection_scraper import DEFAULT_COLLECTION
+
+    base = _router(_product_html(*LIVE), {LIVE[0]: True}, _feed((LIVE, True)))
+
+    def route(url):
+        if url.split('?')[0].endswith('/collections.json'):
+            return _FakeResponse(payload={'collections': [
+                {'handle': DEFAULT_COLLECTION, 'title': 'One and Done'}]})
+        return base(url)
+
+    fake = _FakeRequests(route)
+    check_db = DatabaseManager(db_path=os.path.join(WORK, 'once.db'),
+                               backup_dir=os.path.join(WORK, 'oncebackups'))
+    check_db.get_or_create_default_user()
+    # The minute-by-minute case: the live product is already recorded.  (A
+    # product change deliberately re-reads the queue afterwards, since the
+    # front of it has just moved - that second read is not the duplicate.)
+    check_db.add_product(item_number=LIVE[1], name=LIVE[2], sale_price=LIVE[3],
+                         regular_price=LIVE[4], collection_handle=DEFAULT_COLLECTION,
+                         handle=LIVE[0])
+    monitor = MonitorService(check_db, validation_checks=1, validation_delay=0)
+
+    originals = cs.requests, fs.requests
+    fs.FestoolScraper._reset_stock_backoff()
+    try:
+        cs.requests = fs.requests = fake
+        changed = monitor._check_for_changes()
+    finally:
+        cs.requests, fs.requests = originals
+        monitor.shutdown()
+
+    assert changed is None, "an unchanged store was reported as a new product"
+    assert any(u.endswith('.js') for u in fake.calls), \
+        "the check never got as far as resolving the live product"
+    feed_reads = [u for u in fake.calls if 'products.json' in u]
+    assert len(feed_reads) == 1, f"feed downloaded {len(feed_reads)} times: {feed_reads}"
+
+
 def stale_front_page_with_no_fallback_records_nothing():
     """Better to skip a check than to record a sold-out product."""
     router = _router(_product_html(*SOLD), {SOLD[0]: False}, None)
@@ -1378,6 +1429,7 @@ check("sold-out head of the queue stepped over", sold_out_head_of_the_queue_is_s
 check("feed outage falls back to the front page", feed_outage_falls_back_to_the_front_page)
 check("failed stock check does not discard scrape", unverifiable_stock_keeps_the_scrape)
 check("rate-limited stock check backs off", rate_limited_stock_check_backs_off)
+check("one check downloads the feed once", one_check_downloads_the_feed_once)
 check("no fallback records nothing", stale_front_page_with_no_fallback_records_nothing)
 check("queue positions skip sold-out items", queue_positions_skip_sold_out_items)
 
@@ -1763,6 +1815,58 @@ def resuming_the_rotation_opens_a_new_listing():
     monitor.shutdown()
 
 
+def renamed_rotation_is_revalidated_from_its_own_feed():
+    """
+    A product change is re-checked against the collection actually rotating.
+
+    The re-check scrapers used to be built on the default collection name.
+    With the store rotating out of 'rotation' while 'oneanddone' is still
+    published with something else in stock, every re-check resolved that
+    other item and threw the real change away as a false positive.
+    """
+    from scraper import collection_scraper as cs
+    from scraper import festool_scraper as fs
+    from scraper.monitor import MonitorService
+
+    rotating = _feed((LIVE, True))
+    leftover = _feed((QUEUED, True))   # the default collection, still published
+    base = _router(_product_html(*LIVE), {LIVE[0]: True, QUEUED[0]: True}, None)
+
+    def route(url):
+        path = url.split('?')[0]
+        if path.endswith('/collections.json'):
+            return _FakeResponse(payload={'collections': [
+                {'handle': 'rotation', 'title': 'Rotation'}]})
+        if path.endswith('/collections/rotation/products.json'):
+            return _FakeResponse(payload=rotating)
+        if path.endswith('/collections/oneanddone/products.json'):
+            return _FakeResponse(payload=leftover)
+        return base(url)
+
+    vdb = DatabaseManager(db_path=os.path.join(WORK, 'renamed.db'),
+                          backup_dir=os.path.join(WORK, 'renbackups'))
+    vdb.get_or_create_default_user()
+    vdb.add_product(item_number=SOLD[1], name=SOLD[2], sale_price=SOLD[3],
+                    collection_handle='rotation', handle=SOLD[0])
+    # Two observations: the check's own plus one re-check with a fresh scraper
+    monitor = MonitorService(vdb, validation_checks=2, validation_delay=0)
+
+    fake = _FakeRequests(route)
+    originals = cs.requests, fs.requests
+    fs.FestoolScraper._reset_stock_backoff()
+    try:
+        cs.requests = fs.requests = fake
+        product = monitor._check_for_changes()
+    finally:
+        cs.requests, fs.requests = originals
+        monitor.shutdown()
+
+    assert product is not None, "a real change was rejected as a false positive"
+    assert product['item_number'] == LIVE[1], product['item_number']
+    assert not any('/collections/oneanddone/' in u for u in fake.calls), \
+        "a re-check read the default collection instead of the rotating one"
+
+
 def a_listing_links_to_its_own_page():
     """The Collection tab links each row; a guessed URL would 404."""
     ldb = DatabaseManager(db_path=os.path.join(WORK, 'links.db'),
@@ -1800,6 +1904,8 @@ check("no invented duration reaches the averages",
       an_invented_duration_never_reaches_the_averages)
 check("resuming the rotation opens a new listing",
       resuming_the_rotation_opens_a_new_listing)
+check("renamed rotation is re-validated from its own feed",
+      renamed_rotation_is_revalidated_from_its_own_feed)
 check("a listing links to its own page", a_listing_links_to_its_own_page)
 check("a relisted item picks up its current slug",
       a_relisted_item_picks_up_its_current_slug)

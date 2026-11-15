@@ -63,6 +63,21 @@ class FestoolScraper:
         # The front page, read at most once per instance (see _fetch_soup)
         self._front_soup = None
         self._front_soup_read = False
+        # Collection feeds already downloaded this check (see prime_feeds)
+        self._primed_feeds: Dict[str, List[dict]] = {}
+
+    def prime_feeds(self, raw_feeds: Dict[str, List[dict]]) -> None:
+        """
+        Hand over collection feeds the caller has already downloaded.
+
+        The store survey reads every collection's feed seconds before the live
+        product is resolved from one of them, so downloading it again only
+        doubles the traffic to an endpoint the app now depends on entirely
+        (the per-product stock endpoint is rate-limited).  Like the front
+        page, a primed feed lives as long as this instance, which is one
+        check.  A collection that was not primed is still fetched as before.
+        """
+        self._primed_feeds.update(raw_feeds or {})
 
     def fetch_current_product(self) -> Optional[Dict]:
         """
@@ -312,15 +327,19 @@ class FestoolScraper:
         Returns an empty list on failure - callers must not read that as "the
         collection is empty".
         """
-        url = (f"{self.BASE_URL}collections/{self.COLLECTION}/products.json"
-               f"?limit=250")
-        try:
-            response = requests.get(url, headers=self._json_headers(), timeout=self.timeout)
-            response.raise_for_status()
-            products = response.json().get('products', [])
-        except (requests.RequestException, ValueError) as e:
-            logger.error(f"Could not read the collection feed: {e}")
-            return []
+        products = self._primed_feeds.get(self.COLLECTION)
+        if products is not None:
+            logger.debug(f"Using the survey's copy of the '{self.COLLECTION}' feed")
+        else:
+            url = (f"{self.BASE_URL}collections/{self.COLLECTION}/products.json"
+                   f"?limit=250")
+            try:
+                response = requests.get(url, headers=self._json_headers(), timeout=self.timeout)
+                response.raise_for_status()
+                products = response.json().get('products', [])
+            except (requests.RequestException, ValueError) as e:
+                logger.error(f"Could not read the collection feed: {e}")
+                return []
 
         entries: List[FeedEntry] = []
         for entry in products:
